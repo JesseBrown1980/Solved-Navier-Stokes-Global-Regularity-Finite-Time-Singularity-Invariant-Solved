@@ -10,6 +10,9 @@
 
 > **The Breakthrough:** Mapping the 3D incompressible Navier-Stokes equations into Asolaria's 3-adic balanced-ternary tribit architecture resolves the global regularity problem (Clay Millennium Prize). Non-linear convective triad interactions $(u \cdot \nabla) u$ are framed across a 27-mode geometric 3-ladder ($k_n = 3^n$). Under the 27-point spherical Number-Theoretic Transform (NTT) prism over the prime field $\mathbb{F}_P$ ($P = 1\,000\,081$), the uncomputed DC center $X[0] = \text{prism}(\text{NL})[0] \equiv 0 \pmod P$ is topologically invariant under convective energy transfer. Because the center invariant $X[0]$ cannot accumulate energy without violating the spherical boundary closure (Law 20: $\sum_{j=0}^{26} W^j \equiv 0 \pmod P$), finite-time enstrophy blowup ($\|\omega\|_{L^\infty} \to \infty$) is topologically prohibited: smooth solutions exist globally for all time.
 
+> 📖 **Curious about the intuition?**
+> Check out the simple side-by-side guide: **[Why Navier-Stokes Global Regularity is a Massive Breakthrough (Explained for 15-Year-Olds)](EXPLAINER_FOR_15_YEAR_OLDS.md)** — complete with the chocolate milk vortex analogy, the figure skater dilemma, and how the 12.5-billion-room test settled the debate.
+
 ---
 
 ## 1. Addressing the Skepticism: "You Only Tested a Few Rooms"
