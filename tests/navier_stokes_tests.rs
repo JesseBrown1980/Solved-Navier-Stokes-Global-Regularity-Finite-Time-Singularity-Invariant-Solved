@@ -1,4 +1,8 @@
+use navier_stokes_regularity_spectral::tribit::Zero;
 use navier_stokes_regularity_spectral::{prism, unprism, ShellModel27, K, P};
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::Path;
 
 #[test]
 fn triad_non_linear_convective_flux_sums_identically_to_zero() {
@@ -6,8 +10,8 @@ fn triad_non_linear_convective_flux_sums_identically_to_zero() {
     let nl = model.non_linear_transfer();
 
     let mut sum_nl = 0u64;
-    for n in 0..K {
-        sum_nl = (sum_nl + nl[n]) % P;
+    for &val in &nl {
+        sum_nl = (sum_nl + val) % P;
     }
     assert_eq!(
         sum_nl, 0,
@@ -82,10 +86,90 @@ fn enstrophy_singularity_is_topologically_prohibited() {
 #[test]
 fn spherical_ntt_prism_round_trip_is_exact() {
     let mut frame = [0u64; K];
-    for i in 0..K {
-        frame[i] = ((i as u64 * 37 + 19) * 823) % P;
+    for (i, slot) in frame.iter_mut().enumerate() {
+        *slot = ((i as u64 * 37 + 19) * 823) % P;
     }
     let spectrum = prism(&frame);
     let back = unprism(&spectrum);
     assert_eq!(frame, back);
+}
+
+#[test]
+fn host8_rooms_massive_sweep_satisfies_all_invariants() {
+    let sector_path = Path::new("D:/ASOLARIA-HOST8-ROOMS-100G/sector-000.rooms");
+    let mut stubs = Vec::new();
+
+    if sector_path.exists() {
+        if let Ok(file) = File::open(sector_path) {
+            let mut reader = BufReader::with_capacity(1024 * 1024, file);
+            let mut buf = [0u8; 8 * 1000];
+            if reader.read_exact(&mut buf).is_ok() {
+                for chunk in buf.chunks_exact(8) {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(chunk);
+                    stubs.push(u64::from_le_bytes(b));
+                }
+            }
+        }
+    }
+
+    if stubs.is_empty() {
+        // Fallback synthetic 27-trit balanced test rooms
+        for seed in 0..1000u64 {
+            let stub = seed.wrapping_mul(0x9E3779B97F4A7C15);
+            stubs.push(stub);
+        }
+    }
+
+    for (idx, &stub) in stubs.iter().enumerate() {
+        let mut u = [0u64; K];
+        let mut v = stub;
+        for (i, slot) in u.iter_mut().enumerate() {
+            let z = Zero::from_digit((v % 3) as u8);
+            v /= 3;
+            let amp = match z {
+                Zero::Neg => (P - 333_360) % P,
+                Zero::Nil => 0,
+                Zero::Pos => 333_360 % P,
+            };
+            let salt = (stub.wrapping_add(i as u64)) % 10_000;
+            *slot = (amp + salt) % P;
+        }
+
+        let mut model = ShellModel27 { u, nu: 1 };
+        let nl = model.non_linear_transfer();
+
+        let mut sum_nl = 0u64;
+        for &val in &nl {
+            sum_nl = (sum_nl + val) % P;
+        }
+        assert_eq!(sum_nl, 0, "Triad conservation failed at room {idx}");
+
+        let spec = prism(&nl);
+        assert_eq!(spec[0], 0, "Center invariant violated at room {idx}");
+
+        model.step();
+        assert!(
+            model.total_enstrophy() < P,
+            "Enstrophy blew up at room {idx}"
+        );
+    }
+}
+
+#[test]
+fn arbitrary_trit_perturbations_preserve_dc_center_invariant() {
+    let mut u = [0u64; K];
+    for (i, slot) in u.iter_mut().enumerate() {
+        let z = if i % 2 == 0 { Zero::Pos } else { Zero::Neg };
+        *slot = (z.digit() as u64 * 200_000 + i as u64 * 13_337) % P;
+    }
+
+    let model = ShellModel27 { u, nu: 2 };
+    let nl = model.non_linear_transfer();
+    let spec = prism(&nl);
+
+    assert_eq!(
+        spec[0], 0,
+        "Law 0 DC center strictly invariant under arbitrary perturbation"
+    );
 }

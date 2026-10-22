@@ -5,7 +5,7 @@
 //! Navier-Stokes equations has been blocked by the quadratic vortex-stretching term (ω · ∇)u,
 //! which could theoretically trigger a finite-time enstrophy singularity (‖ω‖_L∞ → ∞).
 //!
-//! In Asolaria's 3-adic balanced-ternary space:
+//! In Asolaria's 3-adic balanced-ternary tribit space:
 //! - Wavenumbers are organized on the geometric 3-ladder k_n = 3^n across 27 rime dimensions (K = 27 = 3³).
 //! - Non-linear convective triad interactions (u · ∇)u conserve kinetic energy identically:
 //!     ∑_{n=0}^{26} NL_n ≡ 0 (mod P).
@@ -14,10 +14,56 @@
 //! - Because the center invariant X[0] cannot accumulate energy without violating the spherical
 //!   boundary closure (Law 20: ∑ W^j ≡ 0 mod P), finite-time enstrophy blowup is topologically prohibited.
 
+#![deny(
+    clippy::float_arithmetic,
+    clippy::cast_precision_loss,
+    clippy::float_cmp
+)]
+#![forbid(unsafe_code)]
+
 pub const P: u64 = 1_000_081;
 pub const G: u64 = 7;
 pub const K: usize = 27;
 pub const W: u64 = 951_846;
+
+/// The three zeros of balanced ternary / tribit space.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(i8)]
+pub enum Zero {
+    Neg = -1,
+    Nil = 0,
+    Pos = 1,
+}
+
+impl Zero {
+    #[inline]
+    pub const fn magnitude(self) -> i8 {
+        0
+    }
+
+    #[inline]
+    pub const fn direction(self) -> i8 {
+        self as i8
+    }
+
+    #[inline]
+    pub const fn digit(self) -> u8 {
+        (self as i8 + 1) as u8
+    }
+
+    #[inline]
+    pub const fn from_digit(d: u8) -> Self {
+        match d % 3 {
+            0 => Zero::Neg,
+            1 => Zero::Nil,
+            _ => Zero::Pos,
+        }
+    }
+}
+
+pub mod tribit {
+    pub use super::Zero;
+}
 
 // ---------------------------------------------------------------- Modular arithmetic & NTT
 
@@ -56,15 +102,15 @@ pub const fn inv_mod(a: u64) -> u64 {
 
 pub fn prism(x: &[u64; K]) -> [u64; K] {
     let mut out = [0u64; K];
-    for j in 0..K {
+    for (j, slot) in out.iter_mut().enumerate() {
         let wj = pow_mod(W, j as u64);
         let mut acc = 0u64;
         let mut t = 1u64;
-        for i in 0..K {
-            acc = add_mod(acc, mul_mod(x[i] % P, t));
+        for val in x {
+            acc = add_mod(acc, mul_mod(val % P, t));
             t = mul_mod(t, wj);
         }
-        out[j] = acc;
+        *slot = acc;
     }
     out
 }
@@ -73,15 +119,15 @@ pub fn unprism(x: &[u64; K]) -> [u64; K] {
     let winv = inv_mod(W);
     let kinv = inv_mod(K as u64);
     let mut out = [0u64; K];
-    for j in 0..K {
+    for (j, slot) in out.iter_mut().enumerate() {
         let wj = pow_mod(winv, j as u64);
         let mut acc = 0u64;
         let mut t = 1u64;
-        for i in 0..K {
-            acc = add_mod(acc, mul_mod(x[i] % P, t));
+        for val in x {
+            acc = add_mod(acc, mul_mod(val % P, t));
             t = mul_mod(t, wj);
         }
-        out[j] = mul_mod(acc, kinv);
+        *slot = mul_mod(acc, kinv);
     }
     out
 }
@@ -103,7 +149,7 @@ impl ShellModel27 {
 
     pub fn non_linear_transfer(&self) -> [u64; K] {
         let mut nl = [0u64; K];
-        for n in 1..K - 1 {
+        for (n, slot) in nl.iter_mut().enumerate().take(K - 1).skip(1) {
             let u_prev = self.u[n - 1] as u128;
             let u_curr = self.u[n] as u128;
             let u_next = self.u[n + 1] as u128;
@@ -112,12 +158,12 @@ impl ShellModel27 {
             let term2 = (u_prev * u_curr) % P as u128;
 
             let transfer = (term1 + P as u128 - term2) % P as u128;
-            nl[n] = transfer as u64;
+            *slot = transfer as u64;
         }
 
         let mut sum_interior = 0u128;
-        for n in 1..K - 1 {
-            sum_interior = (sum_interior + nl[n] as u128) % P as u128;
+        for &item in nl.iter().take(K - 1).skip(1) {
+            sum_interior = (sum_interior + item as u128) % P as u128;
         }
         nl[0] = ((P as u128 - sum_interior / 2) % P as u128) as u64;
         nl[K - 1] = ((P as u128 - sum_interior + sum_interior / 2) % P as u128) as u64;
@@ -127,27 +173,27 @@ impl ShellModel27 {
 
     pub fn step(&mut self) {
         let nl = self.non_linear_transfer();
-        for n in 0..K {
+        for (n, (u_slot, &nl_val)) in self.u.iter_mut().zip(nl.iter()).enumerate() {
             let mut kn = 1u128;
             for _ in 0..n {
                 kn = (kn * 3) % P as u128;
             }
             let diss = (self.nu as u128 * ((kn * kn) % P as u128)) % P as u128;
-            let mut u_new = (self.u[n] as u128 + nl[n] as u128) % P as u128;
+            let mut u_new = (*u_slot as u128 + nl_val as u128) % P as u128;
 
             if u_new > diss {
                 u_new -= diss;
             } else {
                 u_new = (u_new + P as u128 - diss % P as u128) % P as u128;
             }
-            self.u[n] = (u_new % P as u128) as u64;
+            *u_slot = (u_new % P as u128) as u64;
         }
     }
 
     pub fn total_energy(&self) -> u64 {
         let mut acc = 0u128;
-        for n in 0..K {
-            let un = self.u[n] as u128;
+        for &un_val in &self.u {
+            let un = un_val as u128;
             acc = (acc + un * un) % P as u128;
         }
         let half = ((P + 1) / 2) as u128;
@@ -157,8 +203,8 @@ impl ShellModel27 {
     pub fn total_enstrophy(&self) -> u64 {
         let mut acc = 0u128;
         let mut kn = 1u128;
-        for n in 0..K {
-            let un = self.u[n] as u128;
+        for &un_val in &self.u {
+            let un = un_val as u128;
             let kn2 = (kn * kn) % P as u128;
             acc = (acc + kn2 * ((un * un) % P as u128)) % P as u128;
             kn = (kn * 3) % P as u128;
