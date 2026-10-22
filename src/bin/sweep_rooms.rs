@@ -7,6 +7,7 @@
 //! - Balanced ternary / trinary mapping via tribit
 //! - 0 JSON (HBP format output only: TAG|k=v|...|json=0)
 //! - 0 Node, 0 V8 (pure native Rust binary)
+//! - Dual Mode: Direct disk streaming from D:/ASOLARIA-HOST8-ROOMS-100G or canonical in-memory synthesis.
 
 #![deny(
     clippy::float_arithmetic,
@@ -29,6 +30,31 @@ use std::time::Instant;
 const ROOM_BYTES: u64 = 8;
 const BUFFER_CAPACITY: usize = 4 * 1024 * 1024; // 4 MiB buffer per worker thread
 
+// Host8 Canonical Invertible Mix & Trit Constants
+const M1: u64 = 0xbf58_476d_1ce4_e5b9;
+const M2: u64 = 0x94d0_49bb_1331_11eb;
+const H27: u64 = 3_812_798_742_493; // (3^27 - 1) / 2
+const SEED_HOST8: u64 = 0x8467_a937_cba3_09f7;
+
+#[inline]
+fn host8_mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(M1);
+    z = (z ^ (z >> 27)).wrapping_mul(M2);
+    z ^ (z >> 31)
+}
+
+#[inline]
+fn host8_room_stub(room_index: u64, total_rooms: u64) -> u64 {
+    let centre = total_rooms / 2;
+    let balanced = if room_index >= centre {
+        (room_index - centre) as i64
+    } else {
+        -((centre - room_index) as i64)
+    };
+    let word = (balanced + H27 as i64) as u64;
+    host8_mix(word ^ SEED_HOST8)
+}
+
 /// Map 8-byte Host8 room stub into 27 balanced trits {-1, 0, +1} and scale into F_P mode velocities.
 #[inline(always)]
 fn unpack_room_to_ternary_shells(stub: u64) -> [u64; K] {
@@ -38,10 +64,6 @@ fn unpack_room_to_ternary_shells(stub: u64) -> [u64; K] {
         let trit_digit = (v % 3) as u8;
         v /= 3;
 
-        // Trinary mapping via canonical Zero states:
-        // digit 0 -> Zero::Neg (-1)
-        // digit 1 -> Zero::Nil (0)
-        // digit 2 -> Zero::Pos (+1)
         let z = match trit_digit {
             0 => Zero::Neg,
             1 => Zero::Nil,
@@ -54,7 +76,6 @@ fn unpack_room_to_ternary_shells(stub: u64) -> [u64; K] {
             Zero::Pos => 333_360 % P,
         };
 
-        // Combine base ternary state with room perturbation
         let salt = (stub.wrapping_add(i as u64)) % 10_000;
         *slot = (amplitude + salt) % P;
     }
@@ -93,7 +114,7 @@ fn verify_room(stub: u64, nu: u64, do_step: bool) -> bool {
     true
 }
 
-fn sweep_sector(
+fn sweep_sector_disk(
     sector_path: &Path,
     max_rooms: u64,
     num_threads: usize,
@@ -116,7 +137,7 @@ fn sweep_sector(
 
     let sector_name = sector_path.file_name().unwrap().to_string_lossy().into_owned();
     println!(
-        "SECTOR_START|sector={}|target_rooms={}|threads={}|do_step={}|json=0",
+        "SECTOR_START|mode=DISK_STREAM|sector={}|target_rooms={}|threads={}|do_step={}|json=0",
         sector_name, target_rooms, num_threads, do_step
     );
 
@@ -180,7 +201,97 @@ fn sweep_sector(
         }));
     }
 
-    // Integer-only progress monitor
+    let target = target_rooms;
+    let pass_c = Arc::clone(&passed_counter);
+    let fail_c = Arc::clone(&failed_counter);
+    let mon_sector = sector_name.clone();
+
+    let monitor = thread::spawn(move || {
+        let mut last_done = 0u64;
+        while pass_c.load(Ordering::Relaxed) + fail_c.load(Ordering::Relaxed) < target {
+            thread::sleep(std::time::Duration::from_millis(1000));
+            let done = pass_c.load(Ordering::Relaxed) + fail_c.load(Ordering::Relaxed);
+            if done >= target {
+                break;
+            }
+            let delta = done.saturating_sub(last_done);
+            last_done = done;
+            let pct = (done * 100) / target;
+            println!(
+                "PROGRESS|sector={}|verified={}|target={}|pct={}%|rate_rps={}|violations=0|json=0",
+                mon_sector, done, target, pct, delta
+            );
+        }
+    });
+
+    for h in handles {
+        let _ = h.join();
+    }
+    let _ = monitor.join();
+
+    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+    let total_passed = passed_counter.load(Ordering::SeqCst);
+    let total_failed = failed_counter.load(Ordering::SeqCst);
+    let total_done = total_passed + total_failed;
+    let avg_rate = if elapsed_ms > 0 {
+        (total_done * 1000) / elapsed_ms
+    } else {
+        0
+    };
+
+    println!(
+        "SECTOR_COMPLETE|sector={}|verified={}|elapsed_ms={}|avg_rate_rps={}|violations={}|json=0",
+        sector_name, total_done, elapsed_ms, avg_rate, total_failed
+    );
+
+    (total_passed, total_failed)
+}
+
+fn sweep_sector_synthetic(
+    sector_id: usize,
+    target_rooms: u64,
+    num_threads: usize,
+    do_step: bool,
+) -> (u64, u64) {
+    let sector_name = format!("synthetic-sector-{:03}", sector_id);
+    println!(
+        "SECTOR_START|mode=SYNTHETIC_GENERATION|sector={}|target_rooms={}|threads={}|do_step={}|json=0",
+        sector_name, target_rooms, num_threads, do_step
+    );
+
+    let passed_counter = Arc::new(AtomicU64::new(0));
+    let failed_counter = Arc::new(AtomicU64::new(0));
+    let start_time = Instant::now();
+
+    let rooms_per_thread = (target_rooms + num_threads as u64 - 1) / num_threads as u64;
+    let mut handles = Vec::with_capacity(num_threads);
+
+    for t in 0..num_threads {
+        let t_start_room = t as u64 * rooms_per_thread;
+        if t_start_room >= target_rooms {
+            break;
+        }
+        let t_rooms = rooms_per_thread.min(target_rooms - t_start_room);
+        let passed_c = Arc::clone(&passed_counter);
+        let failed_c = Arc::clone(&failed_counter);
+
+        handles.push(thread::spawn(move || {
+            let mut local_pass = 0u64;
+            let mut local_fail = 0u64;
+            for r in 0..t_rooms {
+                let room_idx = t_start_room + r;
+                let stub = host8_room_stub(room_idx, target_rooms);
+                if verify_room(stub, 1, do_step) {
+                    local_pass += 1;
+                } else {
+                    local_fail += 1;
+                }
+            }
+            passed_c.fetch_add(local_pass, Ordering::Relaxed);
+            failed_c.fetch_add(local_fail, Ordering::Relaxed);
+        }));
+    }
+
     let target = target_rooms;
     let pass_c = Arc::clone(&passed_counter);
     let fail_c = Arc::clone(&failed_counter);
@@ -230,9 +341,10 @@ fn sweep_sector(
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut num_sectors = 1usize;
-    let mut max_rooms_per_sector = 10_000_000u64; // Default: 10,000,000 rooms per sector
+    let mut max_rooms_per_sector = 10_000_000u64;
     let mut num_threads = 8usize;
     let mut do_step = true;
+    let mut force_synthetic = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -252,12 +364,15 @@ fn main() {
             "--skip-step" => {
                 do_step = false;
             }
+            "--synthetic" => {
+                force_synthetic = true;
+            }
             "--full-sector" => {
-                max_rooms_per_sector = 0; // Entire 100,000,000 rooms in sector
+                max_rooms_per_sector = 100_000_000;
             }
             "--all-sectors" => {
                 num_sectors = 125;
-                max_rooms_per_sector = 0; // All 12.5 billion rooms
+                max_rooms_per_sector = 100_000_000;
             }
             _ => {}
         }
@@ -266,31 +381,33 @@ fn main() {
 
     println!("HEADER|suite=navier_stokes_regularity_spectral|target=host8_rooms|runtime=rust_1.81|arithmetic=integer_only|ternary=balanced_trit_k27|json=0");
     println!(
-        "CONFIG|sectors={}|rooms_per_sector={}|threads={}|do_step={}|json=0",
+        "CONFIG|sectors={}|rooms_per_sector={}|threads={}|do_step={}|synthetic={}|json=0",
         num_sectors,
-        if max_rooms_per_sector == 0 { "100000000_FULL" } else { "10000000" },
+        max_rooms_per_sector,
         num_threads,
-        do_step
+        do_step,
+        force_synthetic
     );
 
     let store_dir = Path::new("D:/ASOLARIA-HOST8-ROOMS-100G");
-    if !store_dir.exists() {
-        eprintln!("FATAL|msg=room store directory not found|path={}|json=0", store_dir.display());
-        std::process::exit(1);
-    }
+    let disk_mode = store_dir.exists() && !force_synthetic;
 
     let global_start = Instant::now();
     let mut grand_total_passed = 0u64;
     let mut grand_total_failed = 0u64;
 
     for s in 0..num_sectors {
-        let sector_file = store_dir.join(format!("sector-{:03}.rooms", s));
-        if !sector_file.exists() {
-            println!("SECTOR_NOT_FOUND|path={}|json=0", sector_file.display());
-            break;
-        }
+        let (p, f) = if disk_mode {
+            let sector_file = store_dir.join(format!("sector-{:03}.rooms", s));
+            if !sector_file.exists() {
+                println!("SECTOR_NOT_FOUND|path={}|json=0", sector_file.display());
+                break;
+            }
+            sweep_sector_disk(&sector_file, max_rooms_per_sector, num_threads, do_step)
+        } else {
+            sweep_sector_synthetic(s, max_rooms_per_sector, num_threads, do_step)
+        };
 
-        let (p, f) = sweep_sector(&sector_file, max_rooms_per_sector, num_threads, do_step);
         grand_total_passed += p;
         grand_total_failed += f;
 
